@@ -10,6 +10,7 @@ from aiogram.types import FSInputFile, URLInputFile
 from aiogram.utils.media_group import MediaGroupBuilder
 
 from downloader import get_instagram_media
+import database as db
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -41,21 +42,17 @@ def is_admin(user_id: int) -> bool:
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     """Обработчик команды /start"""
-    if not is_admin(message.from_user.id):
-         await message.answer("Извините, бот в стадии закрытого тестирования.")
-         return
-         
     await message.answer(
         "👋 Привет! Я скачиваю видео и фото из **Instagram**.\n\n"
         "Просто отправь мне ссылку на Reels, пост (Post) или Story!\n"
-        "Пример: `https://www.instagram.com/reel/C1234567890/`"
+        "Пример: `https://www.instagram.com/reel/C1234567890/` \n\n"
+        "⚠️ **Важно:** Я не могу скачивать медиафайлы из приватных (закрытых) аккаунтов. Убедитесь, что профиль автора открыт.",
+        parse_mode="Markdown"
     )
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
     """Обработка всех текстовых сообщений (поиск ссылок)"""
-    if not is_admin(message.from_user.id):
-        return
 
     # Ищем ссылку на инсту
     match = INSTAGRAM_REGEX.search(message.text)
@@ -65,6 +62,21 @@ async def handle_text(message: types.Message):
 
     url = match.group(1)
     
+    # ПРОВЕРКА ЛИМИТОВ
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        stats = db.get_user_stats(user_id)
+        # stats = (count, is_premium)
+        if not stats[1] and stats[0] >= 3:
+            await message.answer(
+                "❌ **Лимит бесплатных скачиваний исчерпан!**\n\n"
+                "Вы использовали свои 3 бесплатных запроса. \n"
+                "Для получения безлимитного доступа (Premium), пожалуйста, свяжитесь с администратором: @it_sp_admin\n\n"
+                "💳 Стоимость Premium: 200 руб / месяц.",
+                parse_mode="Markdown"
+            )
+            return
+
     # Отправляем статус "Печатает..." или сообщение ожидания
     status_msg = await message.answer("⏳ Скачиваю медиа... Пожалуйста, подождите.")
     
@@ -79,6 +91,10 @@ async def handle_text(message: types.Message):
         return
 
     try:
+        # Увеличиваем счетчик только при успехе (для не-админов)
+        if not is_admin(user_id):
+            db.increment_request(user_id)
+
         if len(media_items) == 1:
             # Одиночное медиа (фото или видео)
             item = media_items[0]
@@ -87,23 +103,28 @@ async def handle_text(message: types.Message):
             else:
                 await bot.send_photo(chat_id=message.chat.id, photo=URLInputFile(item["url"]))
         else:
-            # Карусель (несколько фото/видео)
-            media_group = MediaGroupBuilder()
-            for item in media_items:
-                if item["type"] == "video":
-                    media_group.add_video(media=URLInputFile(item["url"]))
-                else:
-                    media_group.add_photo(media=URLInputFile(item["url"]))
-            
-            await bot.send_media_group(chat_id=message.chat.id, media=media_group.build())
+            # Разрезаем список медиа на части по 10 (лимит Telegram)
+            for i in range(0, len(media_items), 10):
+                chunk = media_items[i:i + 10]
+                media_group = MediaGroupBuilder()
+                for item in chunk:
+                    if item["type"] == "video":
+                        media_group.add_video(media=URLInputFile(item["url"]))
+                    else:
+                        media_group.add_photo(media=URLInputFile(item["url"]))
+                
+                await bot.send_media_group(chat_id=message.chat.id, media=media_group.build())
+                # Небольшая пауза между группами, чтобы избежать флуд-контроля
+                if len(media_items) > 10:
+                    await asyncio.sleep(1)
             
         # Удаляем статусное сообщение при успехе
         await status_msg.delete()
         log.info(f"Успешно отправлено {len(media_items)} медиа пользователю {message.from_user.id}")
 
     except Exception as e:
-        log.error(f"Ошибка при отправке в Telegram: {e}")
-        await status_msg.edit_text(f"❌ Ошибка отправки в Telegram: файл слишком большой или недоступен.")
+        log.error(f"Ошибка при отправке в Telegram: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Ошибка отправки в Telegram: {str(e)[:100]}...")
 
 
 async def main():

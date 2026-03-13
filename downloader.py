@@ -3,7 +3,9 @@ import requests
 import logging
 from dotenv import load_dotenv
 
-load_dotenv()
+# Загружаем переменные окружения из корня папки проекта
+env_path = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(dotenv_path=env_path)
 
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST")

@@ -13,7 +13,8 @@ from downloader import get_instagram_media
 import database as db
 
 # Загружаем переменные окружения
-load_dotenv()
+env_path = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(dotenv_path=env_path)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_USERS = os.getenv("ALLOWED_USERS", "")
 

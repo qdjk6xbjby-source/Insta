@@ -1,136 +1,373 @@
+"""
+==============================================
+  TELEGRAM MEDIA GRABBER BOT
+==============================================
+Бот для скачивания медиа из закрытых Telegram-каналов.
+
+Перед запуском:
+1. Заполни config.py
+2. Запусти create_session.py для авторизации
+3. Запусти этот файл: python bot.py
+"""
+
+import os
+import sys
 import asyncio
 import logging
-import os
-import re
-from dotenv import load_dotenv
+import time
 
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import FSInputFile, URLInputFile
-from aiogram.utils.media_group import MediaGroupBuilder
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
-from downloader import get_instagram_media
-import database as db
+# Добавляем текущую директорию
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Загружаем переменные окружения
-env_path = os.path.join(os.path.dirname(__file__), ".env")
-load_dotenv(dotenv_path=env_path)
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ALLOWED_USERS = os.getenv("ALLOWED_USERS", "")
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from pyrogram.enums import ParseMode
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+from config import BOT_TOKEN, API_ID, API_HASH, ALLOWED_USERS, PROXY
+from grabber import TelegramGrabber, parse_telegram_link
+from database import check_access, increment_request, get_remaining_attempts
 
-# Регулярное выражение для поиска ссылок Instagram
-INSTAGRAM_REGEX = re.compile(r"(https?://(?:www\.)?instagram\.com/(?:p|reel|reels|tv|stories)/[A-Za-z0-9_-]+)")
+# Логирование
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+log = logging.getLogger("bot")
 
-# Инициализация бота
-if not BOT_TOKEN or BOT_TOKEN == "СЮДА_ВСТАВЬ_ТОКЕН_НОВОГО_БОТА":
-    log.error("BOT_TOKEN не настроен в .env!")
-    exit(1)
+# ============================================
+#  Инициализация
+# ============================================
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+bot = Client(
+    name="grabber_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    workdir=os.path.dirname(os.path.abspath(__file__)),
+    max_concurrent_transmissions=1,
+    proxy=PROXY
+)
 
-def is_admin(user_id: int) -> bool:
-    """Проверка, является ли пользователь админом (если нужно ограничить доступ)"""
-    if not ALLOWED_USERS:
-        return True # Если список пуст, разрешаем всем
-    allowed_ids = [int(x.strip()) for x in ALLOWED_USERS.split(",") if x.strip()]
-    return user_id in allowed_ids
+# Граббер (работает через User API)
+grabber = TelegramGrabber()
 
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    """Обработчик команды /start"""
-    await message.answer(
-        "👋 Привет! Я скачиваю видео и фото из **Instagram**.\n\n"
-        "Просто отправь мне ссылку на Reels, пост (Post) или Story!\n"
-        "Пример: `https://www.instagram.com/reel/C1234567890/` \n\n"
-        "⚠️ **Важно:** Я не могу скачивать медиафайлы из приватных (закрытых) аккаунтов. Убедитесь, что профиль автора открыт.",
-        parse_mode="Markdown"
+
+# ============================================
+#  Утилиты
+# ============================================
+
+
+
+def format_size(size_bytes: int) -> str:
+    """Форматирует размер файла в читаемый вид."""
+    if not size_bytes:
+        return "неизвестно"
+    if size_bytes < 1024:
+        return f"{size_bytes} Б"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} КБ"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} МБ"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} ГБ"
+
+
+MEDIA_TYPE_NAMES = {
+    "video": "🎬 Видео",
+    "photo": "📸 Фото",
+    "animation": "🎞 GIF",
+    "document": "📄 Документ",
+    "video_note": "⭕ Видеосообщение",
+    "voice": "🎤 Голосовое",
+    "audio": "🎵 Аудио",
+    "sticker": "🃏 Стикер",
+}
+
+
+class ProgressCallback:
+    """Класс для отслеживания прогресса (без вывода в чат)."""
+    def __init__(self, message: Message, action_text: str):
+        self.message = message
+        self.action_text = action_text
+        self.last_update_time = time.time()
+
+    async def __call__(self, current, total, idx=None, total_items=None, filename=None, action="download"):
+        # Мы больше не редактируем сообщение каждые 2 секунды, 
+        # чтобы не создавать эффект "мигания" и не выглядеть устаревшим.
+        pass
+
+
+# ============================================
+#  Команда /start
+# ============================================
+
+@bot.on_message(filters.command("start") & filters.private)
+async def start_command(client: Client, message: Message):
+    remaining = get_remaining_attempts(message.from_user.id, ALLOWED_USERS)
+    
+    status_text = ""
+    if remaining == float('inf'):
+        status_text = "🔓 **У вас неограниченный доступ (Admin/Premium).**"
+    else:
+        status_text = f"🎁 **У вас осталось бесплатных попыток: {remaining}**"
+
+    await message.reply(
+        f"👋 **Привет! Я Media Grabber Bot**\n\n"
+        "Отправь мне ссылку на сообщение из Telegram-канала, "
+        "и я скачаю оттуда видео или фото.\n\n"
+        f"{status_text}\n\n"
+        "**Поддерживаемые форматы ссылок:**\n"
+        "• `https://t.me/c/123456/789` — приватный канал\n"
+        "• `https://t.me/channel/789` — публичный канал\n\n"
+        "**Поддерживаемые типы медиа:**\n"
+        "🎬 Видео • 📸 Фото • 🎞 GIF • 📄 Документы",
+        parse_mode=ParseMode.MARKDOWN
     )
 
-@dp.message(F.text)
-async def handle_text(message: types.Message):
-    """Обработка всех текстовых сообщений (поиск ссылок)"""
+@bot.on_message(filters.command("status") & filters.private)
+async def status_command(client: Client, message: Message):
+    remaining = get_remaining_attempts(message.from_user.id, ALLOWED_USERS)
+    
+    if remaining == float('inf'):
+        await message.reply("🌟 У вас **премиум-доступ** или вы **администратор**. Ограничений нет!")
+    elif remaining > 0:
+        await message.reply(f"📊 У вас осталось **{remaining}** бесплатных скачиваний.")
+    else:
+        await message.reply("❌ Бесплатные попытки закончились. Для пополнения свяжитесь с администратором.")
 
-    # Ищем ссылку на инсту
-    match = INSTAGRAM_REGEX.search(message.text)
-    if not match:
-        await message.answer("❌ Я не вижу здесь ссылку на Instagram Reels, Post или Story.")
+
+# ============================================
+#  Обработка ссылок
+# ============================================
+
+@bot.on_message(filters.text & filters.private)
+async def handle_link(client: Client, message: Message):
+    if not check_access(message.from_user.id, ALLOWED_USERS):
+        await message.reply("❌ У вас закончились бесплатные попытки. Свяжитесь с админом для покупки доступа.")
         return
 
-    url = match.group(1)
-    
-    # ПРОВЕРКА ЛИМИТОВ
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        stats = db.get_user_stats(user_id)
-        # stats = (count, is_premium)
-        if not stats[1] and stats[0] >= 3:
-            await message.answer(
-                "❌ **Лимит бесплатных скачиваний исчерпан!**\n\n"
-                "Вы использовали свои 3 бесплатных запроса. \n"
-                "Для получения безлимитного доступа (Premium), пожалуйста, свяжитесь с администратором: @it_sp_admin\n\n"
-                "💳 Стоимость Premium: 200 руб / месяц.",
-                parse_mode="Markdown"
-            )
-            return
+    text = message.text.strip()
 
-    # Отправляем статус "Печатает..." или сообщение ожидания
-    status_msg = await message.answer("⏳ Скачиваю медиа... Пожалуйста, подождите.")
-    
-    # Запрашиваем медиа через API
-    media_items = get_instagram_media(url)
-    
-    if not media_items:
-        await status_msg.edit_text(
-            "❌ Не удалось скачать медиа.\n"
-            "Возможно, аккаунт закрыт (Private), ссылка неверная, или сервер перегружен."
+    # Проверяем, что это ссылка на Telegram
+    if not ("t.me/" in text):
+        await message.reply(
+            "🔗 Отправь мне ссылку на сообщение из Telegram-канала.\n"
+            "Пример: `https://t.me/c/123456/789`",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
 
+    # Проверяем, что ссылка парсится
+    parsed = parse_telegram_link(text)
+    if parsed is None:
+        await message.reply(
+            "❌ Не удалось распознать ссылку.\n\n"
+            "**Поддерживаемые форматы:**\n"
+            "• `https://t.me/c/CHANNEL_ID/MSG_ID`\n"
+            "• `https://t.me/USERNAME/MSG_ID`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # Отправляем статус
+    status_msg = await message.reply("⏳ Начинаю скачивание...")
+    progress = ProgressCallback(status_msg, "")
+
+    # Скачиваем с таймаутом
     try:
-        # Увеличиваем счетчик только при успехе (для не-админов)
-        if not is_admin(user_id):
-            db.increment_request(user_id)
-
-        if len(media_items) == 1:
-            # Одиночное медиа (фото или видео)
-            item = media_items[0]
-            if item["type"] == "video":
-                await bot.send_video(chat_id=message.chat.id, video=URLInputFile(item["url"]))
-            else:
-                await bot.send_photo(chat_id=message.chat.id, photo=URLInputFile(item["url"]))
-        else:
-            # Разрезаем список медиа на части по 10 (лимит Telegram)
-            for i in range(0, len(media_items), 10):
-                chunk = media_items[i:i + 10]
-                media_group = MediaGroupBuilder()
-                for item in chunk:
-                    if item["type"] == "video":
-                        media_group.add_video(media=URLInputFile(item["url"]))
-                    else:
-                        media_group.add_photo(media=URLInputFile(item["url"]))
-                
-                await bot.send_media_group(chat_id=message.chat.id, media=media_group.build())
-                # Небольшая пауза между группами, чтобы избежать флуд-контроля
-                if len(media_items) > 10:
-                    await asyncio.sleep(1)
-            
-        # Удаляем статусное сообщение при успехе
-        await status_msg.delete()
-        log.info(f"Успешно отправлено {len(media_items)} медиа пользователю {message.from_user.id}")
-
+        # Устанавливаем таймаут на 60 секунд (на скачивание может уйти время)
+        result = await asyncio.wait_for(grabber.download_media(text, progress_callback=progress), timeout=60)
+    except asyncio.TimeoutError:
+        await status_msg.edit_text("⏱ **Ошибка: время ожидания истекло.**\nПожалуйста, попробуйте еще раз.")
+        return
     except Exception as e:
-        log.error(f"Ошибка при отправке в Telegram: {e}", exc_info=True)
-        await status_msg.edit_text(f"❌ Ошибка отправки в Telegram: {str(e)[:100]}...")
+        log.error(f"Критическая ошибка граббера: {e}")
+        await status_msg.edit_text("❌ Произошла ошибка. Пожалуйста, попробуйте еще раз.")
+        return
 
+    if not result["success"]:
+        error_text = result.get("error") or "❌ Неизвестная ошибка."
+        # Если ошибка техническая, добавляем совет попробовать еще раз
+        if "Ошибка" in error_text or "найдено" in error_text:
+            error_text += "\nПожалуйста, попробуйте еще раз."
+        await status_msg.edit_text(error_text)
+        return
+
+    items = result.get("items", [])
+    if not items:
+        await status_msg.edit_text("❌ Файлы не найдены.")
+        return
+
+    # === ОДИН ФАЙЛ ===
+    if len(items) == 1:
+        item = items[0]
+        media_name = MEDIA_TYPE_NAMES.get(item["media_type"], "📎 Файл")
+        size_str = format_size(item["file_size"])
+        
+        # Убираем лишний текст, оставляем только статус отправки
+        await status_msg.edit_text(f"🚀 Отправляю...")
+
+        file_path = item["file_path"]
+
+        # Функция прогресса для отправки (замыкание)
+        async def upload_progress(current, total, *args):
+            await progress(current, total, 1, 1, item["file_name"], "upload")
+
+        try:
+            # Отправляем в зависимости от типа. 
+            # Для видео не добавляем лишних подписей с размером, чтобы выглядело как пост.
+            if item["media_type"] == "photo":
+                await client.send_photo(message.chat.id, photo=file_path, progress=upload_progress)
+            elif item["media_type"] == "video":
+                # supports_streaming=True помогает Telegram не перекодировать видео (если формат подходит)
+                await client.send_video(
+                    message.chat.id, 
+                    video=file_path, 
+                    width=item.get("width"),
+                    height=item.get("height"),
+                    duration=item.get("duration"),
+                    supports_streaming=True, 
+                    progress=upload_progress
+                )
+            elif item["media_type"] == "animation":
+                await client.send_animation(
+                    message.chat.id, 
+                    animation=file_path, 
+                    width=item.get("width"),
+                    height=item.get("height"),
+                    duration=item.get("duration"),
+                    progress=upload_progress
+                )
+            elif item["media_type"] == "voice":
+                await client.send_voice(message.chat.id, voice=file_path, progress=upload_progress)
+            elif item["media_type"] == "audio":
+                await client.send_audio(message.chat.id, audio=file_path, progress=upload_progress)
+            elif item["media_type"] == "video_note":
+                await client.send_video_note(
+                    message.chat.id, 
+                    video_note=file_path, 
+                    duration=item.get("duration"),
+                    length=item.get("length"),
+                    progress=upload_progress
+                )
+            elif item["media_type"] == "sticker":
+                await client.send_sticker(message.chat.id, sticker=file_path, progress=upload_progress)
+            else:
+                await client.send_document(message.chat.id, document=file_path, progress=upload_progress)
+
+            # Удаляем статусное сообщение
+            await status_msg.delete()
+            # Списываем попытку после успешного скачивания
+            increment_request(message.from_user.id)
+            log.info(f"Отправлено: {item['media_type']} | {item['file_name']} | {size_str} | user={message.from_user.id}")
+
+        except Exception as e:
+            try:
+                await status_msg.edit_text(f"❌ Ошибка при отправке: {str(e)}")
+            except:
+                pass
+            log.error(f"Ошибка отправки: {e}")
+
+        finally:
+            # Удаляем временный файл
+            grabber.cleanup(file_path)
+
+    # === АЛЬБОМ (МЕДИАГРУППА) ===
+    else:
+        await status_msg.edit_text(f"📤 Отправляю альбом ({len(items)} файлов)...")
+        from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
+
+        media_group = []
+        for idx, item in enumerate(items):
+            media_name = MEDIA_TYPE_NAMES.get(item["media_type"], "📎 Файл")
+            size_str = format_size(item["file_size"])
+            caption = f"Альбом • {len(items)} файлов\n{media_name} • {size_str}" if idx == 0 else ""
+            
+            # В Pyrogram для медиагрупп используются только эти 4 типа InputMedia
+            if item["media_type"] == "photo":
+                media_group.append(InputMediaPhoto(item["file_path"], caption=caption))
+            elif item["media_type"] == "video":
+                media_group.append(InputMediaVideo(
+                    item["file_path"], 
+                    caption=caption,
+                    width=item.get("width"),
+                    height=item.get("height"),
+                    duration=item.get("duration"),
+                    supports_streaming=True
+                ))
+            elif item["media_type"] == "audio":
+                media_group.append(InputMediaAudio(item["file_path"], caption=caption))
+            else:
+                media_group.append(InputMediaDocument(item["file_path"], caption=caption))
+                
+        try:
+            await client.send_media_group(message.chat.id, media=media_group)
+            await status_msg.delete()
+            # Списываем попытку после успешного скачивания (альбом)
+            increment_request(message.from_user.id)
+            log.info(f"Отправлен альбом ({len(items)} файлов) | user={message.from_user.id}")
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Ошибка при отправке альбома: {str(e)}")
+            log.error(f"Ошибка отправки альбома: {e}")
+        finally:
+            # Удаляем все временные файлы
+            for item in items:
+                grabber.cleanup(item["file_path"])
+
+
+# ============================================
+#  Запуск
+# ============================================
 
 async def main():
-    log.info("Запуск Instagram Downloader Bot...")
-    await dp.start_polling(bot)
+    """Запуск бота и граббера."""
+    log.info("Запуск граббера (User API)...")
+    await grabber.start()
+    log.info("Граббер запущен!")
+
+    log.info("Запуск бота...")
+    await bot.start()
+    log.info("=" * 40)
+    log.info("  БОТ ЗАПУЩЕН И ГОТОВ К РАБОТЕ!")
+    log.info("=" * 40)
+
+    # Ожидаем завершения и обрабатываем сигналы чисто
+    from pyrogram import idle
+    await idle()
+    
+    log.info("Остановка бота и граббера...")
+    await bot.stop()
+    await grabber.stop()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        # Проверяем, что конфиг заполнен
+        if BOT_TOKEN == "СЮДА_ВСТАВЬ_ТОКЕН_БОТА":
+            print("❌ Заполни BOT_TOKEN в config.py!")
+            sys.exit(1)
+        if API_HASH == "СЮДА_ВСТАВЬ_API_HASH":
+            print("❌ Заполни API_ID и API_HASH в config.py!")
+            sys.exit(1)
+
+        # Проверяем наличие сессии
+        workdir = os.path.dirname(os.path.abspath(__file__))
+        session_file = os.path.join(workdir, "user_session.session")
+        if not os.path.exists(session_file):
+            print("❌ Файл сессии не найден!")
+            print("   Сначала запусти: python create_session.py")
+            sys.exit(1)
+
+        bot.run(main())
+
+    except KeyboardInterrupt:
+        log.info("Бот остановлен.")
+    except Exception as e:
+        log.error(f"Критическая ошибка: {e}")
+        raise

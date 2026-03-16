@@ -1,51 +1,66 @@
 import sqlite3
 import os
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "bot_data.db")
+DB_NAME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data.db")
+FREE_LIMIT = 3
 
 def init_db():
-    """Инициализация базы данных и создание таблиц."""
-    with sqlite3.connect(DB_PATH) as conn:
+    """Инициализирует базу данных."""
+    with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                request_count INTEGER DEFAULT 0,
-                is_premium BOOLEAN DEFAULT 0
+                requests_made INTEGER DEFAULT 0,
+                is_premium INTEGER DEFAULT 0
             )
         ''')
         conn.commit()
 
-def ensure_user(user_id: int):
-    """Проверяет наличие пользователя и создает его, если нет."""
-    with sqlite3.connect(DB_PATH) as conn:
+def get_user_status(user_id: int):
+    """Возвращает статус пользователя (количество сделанных запросов и премиум)."""
+    with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        cursor.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
-        conn.commit()
-
-def get_user_stats(user_id: int):
-    """Возвращает (request_count, is_premium) для пользователя."""
-    ensure_user(user_id)
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute('SELECT request_count, is_premium FROM users WHERE user_id = ?', (user_id,))
-        return cursor.fetchone()
+        cursor.execute("SELECT requests_made, is_premium FROM users WHERE user_id = ?", (user_id,))
+        result = cursor.fetchone()
+        
+        if result:
+            return {"requests_made": result[0], "is_premium": bool(result[1])}
+        else:
+            # Создаем нового пользователя
+            cursor.execute("INSERT INTO users (user_id, requests_made) VALUES (?, ?)", (user_id, 0))
+            conn.commit()
+            return {"requests_made": 0, "is_premium": False}
 
 def increment_request(user_id: int):
     """Увеличивает счетчик запросов пользователя."""
-    ensure_user(user_id)
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        cursor.execute('UPDATE users SET request_count = request_count + 1 WHERE user_id = ?', (user_id,))
+        cursor.execute("UPDATE users SET requests_made = requests_made + 1 WHERE user_id = ?", (user_id,))
         conn.commit()
 
-def set_premium(user_id: int, status: bool = True):
-    """Устанавливает статус премиума."""
-    ensure_user(user_id)
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute('UPDATE users SET is_premium = ? WHERE user_id = ?', (1 if status else 0, user_id))
-        conn.commit()
+def check_access(user_id: int, admin_list: list) -> bool:
+    """Проверяет, есть ли у пользователя доступ (админ, премиум или есть попытки)."""
+    if user_id in admin_list:
+        return True
+    
+    status = get_user_status(user_id)
+    if status["is_premium"]:
+        return True
+    
+    return status["requests_made"] < FREE_LIMIT
 
-# Инициализируем при импорте
+def get_remaining_attempts(user_id: int, admin_list: list):
+    """Возвращает количество оставшихся бесплатных попыток."""
+    if user_id in admin_list:
+        return float('inf')
+    
+    status = get_user_status(user_id)
+    if status["is_premium"]:
+        return float('inf')
+    
+    remaining = FREE_LIMIT - status["requests_made"]
+    return max(0, remaining)
+
+# Инициализируем БД при импорте
 init_db()
